@@ -82,7 +82,7 @@ public class SpringJdbcS3Archiver implements PartitionArchiver {
      * Day comes from the partition's lower bound (in UTC), so the key cleanly aligns
      * with the partition's logical date even if the host is in another timezone.
      */
-    String s3Key(PartitionInfo partition) {
+    static String s3Key(PartitionInfo partition) {
         var lb = partition.lowerBound();
         return String.format(Locale.ROOT,
                 "events/year=%04d/month=%02d/day=%02d/events-%s.csv.gz",

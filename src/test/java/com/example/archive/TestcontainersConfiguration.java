@@ -23,29 +23,50 @@ import java.nio.file.Path;
  * LocalStack S3 isn't covered by Spring Boot's awssdk v2 connection detail
  * autoconfig, so we bridge its endpoint into our own {@code aws.*} properties
  * via DynamicPropertyRegistrar (Spring Framework 6.2+).
+ * <p>
+ * Containers are JVM-singletons started once and shared across every test class
+ * that imports this config. Combined with {@code .withReuse(true)} (opt-in via
+ * {@code ~/.testcontainers.properties} → {@code testcontainers.reuse.enable=true}),
+ * the Dockerfile-built Postgres image only builds once per working copy and
+ * subsequent {@code mvn test} invocations attach to the running containers
+ * instead of cold-starting them.
  */
 @TestConfiguration(proxyBeanMethods = false)
 public class TestcontainersConfiguration {
 
-    @Bean
-    @ServiceConnection
-    PostgreSQLContainer<?> postgresContainer() {
-        DockerImageName image = DockerImageName.parse(
+    static final PostgreSQLContainer<?> POSTGRES;
+    static final LocalStackContainer LOCALSTACK;
+
+    static {
+        DockerImageName pgImage = DockerImageName.parse(
                 new ImageFromDockerfile("archive-poc/postgres-partman:test", false)
                         .withDockerfile(Path.of("docker/postgres/Dockerfile"))
                         .get()
         ).asCompatibleSubstituteFor("postgres");
 
-        return new PostgreSQLContainer<>(image)
+        POSTGRES = new PostgreSQLContainer<>(pgImage)
                 .withDatabaseName("archive")
                 .withUsername("archive")
-                .withPassword("archive");
+                .withPassword("archive")
+                .withReuse(true);
+
+        LOCALSTACK = new LocalStackContainer(DockerImageName.parse("localstack/localstack:3.8"))
+                .withServices(Service.S3)
+                .withReuse(true);
+
+        POSTGRES.start();
+        LOCALSTACK.start();
+    }
+
+    @Bean
+    @ServiceConnection
+    PostgreSQLContainer<?> postgresContainer() {
+        return POSTGRES;
     }
 
     @Bean
     LocalStackContainer localStackContainer() {
-        return new LocalStackContainer(DockerImageName.parse("localstack/localstack:3.8"))
-                .withServices(Service.S3);
+        return LOCALSTACK;
     }
 
     @Bean
