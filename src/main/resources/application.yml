@@ -24,9 +24,15 @@ archive:
 
 aws:
   region: us-east-1
+  # 'test'/'test' are the well-known LocalStack dummy credentials, not real secrets.
+  # Real AWS deployments should remove these and let the SDK's default credentials
+  # provider chain (environment, instance profile, etc.) take over.
   access-key: test
   secret-key: test
   s3:
+    # endpoint-override + path-style-access target LocalStack. For real AWS,
+    # unset endpoint-override and set path-style-access: false (path-style is
+    # being phased out for the Amazon S3 service).
     endpoint-override: http://localhost:4566
     path-style-access: true
 

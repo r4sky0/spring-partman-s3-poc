@@ -7,7 +7,6 @@ import org.springframework.transaction.annotation.Transactional;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
-import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.ThreadLocalRandom;
 
@@ -19,10 +18,12 @@ public class EventService {
             VALUES (:tenantId, :eventType, :payload::jsonb, :createdAt)
             """;
 
-    /** Matches pg_partman's default daily-suffix format so {@code IF NOT EXISTS}
-     *  deduplicates against the partition pg_partman already created for today. */
+    /** Matches pg_partman v5's default daily-suffix format ({@code pYYYYMMDD}) so
+     *  {@code IF NOT EXISTS} deduplicates against the (today ± premake) partitions
+     *  pg_partman already created. {@code ofPattern} (rather than
+     *  {@code BASIC_ISO_DATE}) omits the trailing offset on OffsetDateTime input. */
     private static final DateTimeFormatter PARTMAN_DAILY_SUFFIX =
-            DateTimeFormatter.ofPattern("yyyy_MM_dd");
+            DateTimeFormatter.ofPattern("yyyyMMdd");
 
     private final JdbcClient jdbcClient;
 
@@ -30,8 +31,9 @@ public class EventService {
         this.jdbcClient = jdbcClient;
     }
 
-    @Transactional
     public void insert(Event event) {
+        // No @Transactional: a single INSERT runs in its own implicit tx in autocommit
+        // mode; bulk callers (seed, future batch endpoints) supply the outer @Transactional.
         jdbcClient.sql(INSERT_SQL)
                 .param("tenantId", event.tenantId())
                 .param("eventType", event.eventType())
@@ -40,16 +42,6 @@ public class EventService {
                 // would render in the JVM-local timezone and shift partition assignment.
                 .param("createdAt", event.createdAt())
                 .update();
-    }
-
-    @Transactional
-    public int insertBatch(List<Event> events) {
-        int total = 0;
-        for (Event e : events) {
-            insert(e);
-            total++;
-        }
-        return total;
     }
 
     /**
@@ -82,10 +74,10 @@ public class EventService {
     }
 
     /**
-     * Creates {@code events_pYYYY_MM_DD} as a range partition covering [dayStart, dayStart+1d).
+     * Creates {@code events_pYYYYMMDD} as a range partition covering [dayStart, dayStart+1d).
      * Uses raw DDL because pg_partman v5's {@code create_partition_time} refuses to fabricate
-     * children behind its current high-water mark. {@code IF NOT EXISTS} makes today's call a
-     * no-op when pg_partman has already premade today.
+     * children behind its current high-water mark. {@code IF NOT EXISTS} makes calls for the
+     * (today ± premake) range a no-op against the partitions pg_partman already premade.
      */
     private void ensurePartitionForDay(OffsetDateTime dayStart) {
         String name = "events_p" + dayStart.format(PARTMAN_DAILY_SUFFIX);

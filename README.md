@@ -88,7 +88,7 @@ This runs both:
 ```
 ┌────────────────────┐    JDBC    ┌──────────────────────────┐
 │ Spring Boot 3.5.x  │ ─────────▶ │ Postgres 17 + pg_partman │
-│ Java 21, virtual   │            │   events (parent)        │
+│ Java 25, virtual   │            │   events (parent)        │
 │ threads, JdbcClient│            │   ├─ events_pYYYY_MM_DD  │
 │ AWS SDK v2 S3      │            │   └─ ...                 │
 │                    │            └──────────────────────────┘

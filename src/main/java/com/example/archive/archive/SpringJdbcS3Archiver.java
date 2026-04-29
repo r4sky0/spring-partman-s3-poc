@@ -8,8 +8,6 @@ import org.springframework.jdbc.datasource.DataSourceUtils;
 import org.springframework.stereotype.Service;
 import software.amazon.awssdk.core.sync.RequestBody;
 import software.amazon.awssdk.services.s3.S3Client;
-import software.amazon.awssdk.services.s3.model.HeadObjectResponse;
-import software.amazon.awssdk.services.s3.model.NoSuchKeyException;
 
 import javax.sql.DataSource;
 import java.io.ByteArrayOutputStream;
@@ -23,9 +21,13 @@ import java.util.zip.GZIPOutputStream;
  * Streams a partition's rows out via PostgreSQL's COPY protocol, gzip-compresses
  * them in memory, and uploads the resulting CSV.gz to S3. Buffering in memory
  * (rather than streaming through a piped publisher) keeps the PoC tractable —
- * daily partitions in a typical demo are well under 100 MB compressed. A future
- * variant for very large partitions could swap in the awssdk transfer manager
- * with multipart uploads; the {@link PartitionArchiver} interface is the seam.
+ * daily partitions in a typical demo are well under 100 MB compressed.
+ *
+ * <p><b>PoC limit:</b> {@link ByteArrayOutputStream} caps at 2 GB and
+ * {@code gzipBytes.length} is an {@code int} — partitions whose compressed size
+ * exceeds 2 GB would silently truncate. A production variant should swap in the
+ * AWS SDK Transfer Manager with multipart uploads and stream COPY → gzip →
+ * multipart-part directly. The {@link PartitionArchiver} interface is the seam.
  */
 @Service
 public class SpringJdbcS3Archiver implements PartitionArchiver {
@@ -65,20 +67,13 @@ public class SpringJdbcS3Archiver implements PartitionArchiver {
         String key = s3Key(partition);
         log.info("Uploading partition {} as s3://{}/{} ({} rows, {} bytes)",
                 partition.tableName(), props.bucket(), key, rowCount, gzipBytes.length);
+        // PutObject returns successfully only after S3 has accepted and durably
+        // stored the object — there's no need for a follow-up HEAD verification.
         s3Client.putObject(b -> b.bucket(props.bucket())
                         .key(key)
                         .contentType("application/gzip"),
                 RequestBody.fromBytes(gzipBytes));
 
-        HeadObjectResponse head;
-        try {
-            head = s3Client.headObject(b -> b.bucket(props.bucket()).key(key));
-        } catch (NoSuchKeyException e) {
-            throw new ArchiveException("S3 object missing after PUT for " + partition.tableName(), e);
-        }
-        if (head.contentLength() == null || head.contentLength() == 0) {
-            throw new ArchiveException("S3 object is empty for " + partition.tableName());
-        }
         return new ArchiveResult(props.bucket(), key, rowCount, gzipBytes.length);
     }
 

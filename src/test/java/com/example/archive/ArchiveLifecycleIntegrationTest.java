@@ -122,11 +122,12 @@ class ArchiveLifecycleIntegrationTest {
         // to create partitions behind its current high-water mark. Raw DDL is fine because
         // the Postgres native partitioning engine doesn't care who created the child;
         // pg_partman picks it up on the next show_partitions() call via pg_inherits.
-        var lower = dayStart;
+        // Uses pg_partman v5's default pYYYYMMDD suffix so IF NOT EXISTS deduplicates
+        // against the (today ± premake) partitions pg_partman already premade — this is
+        // the same naming convention EventService.seed() uses in production.
         var upper = dayStart.plusDays(1);
-        String name = "events_p" + dayStart.toLocalDate()
-                .format(java.time.format.DateTimeFormatter.BASIC_ISO_DATE);
-        String lowerIso = lower.format(java.time.format.DateTimeFormatter.ISO_OFFSET_DATE_TIME);
+        String name = "events_p" + dayStart.format(java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd"));
+        String lowerIso = dayStart.format(java.time.format.DateTimeFormatter.ISO_OFFSET_DATE_TIME);
         String upperIso = upper.format(java.time.format.DateTimeFormatter.ISO_OFFSET_DATE_TIME);
         jdbc.sql("CREATE TABLE IF NOT EXISTS " + name
                 + " PARTITION OF events FOR VALUES FROM ('" + lowerIso + "') TO ('" + upperIso + "')")
