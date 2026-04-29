@@ -1,0 +1,40 @@
+spring:
+  application:
+    name: archive-poc
+  threads:
+    virtual:
+      enabled: true
+  datasource:
+    url: jdbc:postgresql://localhost:5432/archive
+    username: archive
+    password: archive
+    hikari:
+      # Pin every pooled connection to UTC so pg_partman aligns partition bounds
+      # on UTC day boundaries regardless of the JVM-local timezone. Without this,
+      # a CEST-running app would create partitions on +02 boundaries while a
+      # UTC-running replica would create UTC-aligned ones — instant overlap.
+      connection-init-sql: "SET TIME ZONE 'UTC'"
+  flyway:
+    enabled: true
+
+archive:
+  retention: P7D
+  bucket: archive-bucket
+  interval: 60s
+
+aws:
+  region: us-east-1
+  access-key: test
+  secret-key: test
+  s3:
+    endpoint-override: http://localhost:4566
+    path-style-access: true
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  metrics:
+    tags:
+      application: ${spring.application.name}
