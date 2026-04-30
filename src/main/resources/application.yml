@@ -16,6 +16,15 @@ spring:
       connection-init-sql: "SET TIME ZONE 'UTC'"
   flyway:
     enabled: true
+  jpa:
+    # Flyway is the single source of truth for DDL — never let Hibernate touch the schema.
+    hibernate:
+      ddl-auto: none
+    open-in-view: false
+    properties:
+      # Match the Hikari connection-init-sql so OffsetDateTime values bind in UTC
+      # and partition routing aligns with the UTC-pinned partition bounds.
+      hibernate.jdbc.time_zone: UTC
 
 archive:
   retention: P7D

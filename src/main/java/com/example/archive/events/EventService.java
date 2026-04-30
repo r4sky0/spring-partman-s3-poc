@@ -13,11 +13,6 @@ import java.util.concurrent.ThreadLocalRandom;
 @Service
 public class EventService {
 
-    private static final String INSERT_SQL = """
-            INSERT INTO events (tenant_id, event_type, payload, created_at)
-            VALUES (:tenantId, :eventType, :payload::jsonb, :createdAt)
-            """;
-
     /** Matches pg_partman v5's default daily-suffix format ({@code pYYYYMMDD}) so
      *  {@code IF NOT EXISTS} deduplicates against the (today ± premake) partitions
      *  pg_partman already created. {@code ofPattern} (rather than
@@ -25,23 +20,16 @@ public class EventService {
     private static final DateTimeFormatter PARTMAN_DAILY_SUFFIX =
             DateTimeFormatter.ofPattern("yyyyMMdd");
 
+    private final EventRepository repository;
     private final JdbcClient jdbcClient;
 
-    public EventService(JdbcClient jdbcClient) {
+    public EventService(EventRepository repository, JdbcClient jdbcClient) {
+        this.repository = repository;
         this.jdbcClient = jdbcClient;
     }
 
     public void insert(Event event) {
-        // No @Transactional: a single INSERT runs in its own implicit tx in autocommit
-        // mode; bulk callers (seed, future batch endpoints) supply the outer @Transactional.
-        jdbcClient.sql(INSERT_SQL)
-                .param("tenantId", event.tenantId())
-                .param("eventType", event.eventType())
-                .param("payload", event.payloadJson())
-                // OffsetDateTime preserves the UTC offset on the wire; java.sql.Timestamp
-                // would render in the JVM-local timezone and shift partition assignment.
-                .param("createdAt", event.createdAt())
-                .update();
+        repository.save(toEntity(event));
     }
 
     /**
@@ -86,5 +74,14 @@ public class EventService {
         jdbcClient.sql("CREATE TABLE IF NOT EXISTS " + name
                         + " PARTITION OF events FOR VALUES FROM ('" + lowerIso + "') TO ('" + upperIso + "')")
                 .update();
+    }
+
+    private static EventEntity toEntity(Event event) {
+        return new EventEntity(
+                event.tenantId(),
+                event.eventType(),
+                event.payloadJson(),
+                event.createdAt()
+        );
     }
 }
