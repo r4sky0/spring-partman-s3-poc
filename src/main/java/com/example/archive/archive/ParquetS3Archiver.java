@@ -1,12 +1,6 @@
 package com.example.archive.archive;
 
-import org.apache.avro.Schema;
-import org.apache.avro.generic.GenericData;
-import org.apache.avro.generic.GenericRecord;
-import org.apache.parquet.avro.AvroParquetWriter;
-import org.apache.parquet.hadoop.ParquetWriter;
-import org.apache.parquet.hadoop.metadata.CompressionCodecName;
-import org.apache.parquet.io.LocalOutputFile;
+import com.jerolba.carpet.CarpetWriter;
 import org.postgresql.util.PGobject;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -19,16 +13,14 @@ import software.amazon.awssdk.transfer.s3.model.CompletedUpload;
 import software.amazon.awssdk.transfer.s3.model.Upload;
 
 import java.io.IOException;
+import java.io.OutputStream;
 import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.sql.ResultSet;
-import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
-import java.sql.Types;
 import java.time.Instant;
 import java.time.OffsetDateTime;
-import java.time.temporal.ChronoUnit;
 import java.util.Locale;
 import java.util.UUID;
 import java.util.concurrent.CancellationException;
@@ -39,23 +31,34 @@ import java.util.concurrent.CompletionException;
  * queryable by Athena/DuckDB/Spark from S3) instead of gzipped CSV. Selected
  * via {@code archive.format=parquet}.
  *
- * <p>Trades raw streaming for simplicity: the writer assembles the file on
- * local disk first, then hands it to the Transfer Manager. Disk I/O is
- * dwarfed by S3 upload time for any non-trivial partition, and writing to
- * disk avoids the extra producer-thread plumbing the streaming CSV path needs
- * just to make {@code AvroParquetWriter} happy.
+ * <p>Uses Carpet ({@link com.jerolba.carpet.CarpetWriter}) for the write path —
+ * a Java-records-based wrapper around parquet-java that absorbs the Hadoop
+ * dependency dance into its own pom, so this module's pom stays clean of
+ * hadoop-common, spring-boot-maven-plugin exclusions, etc.
  *
- * <h2>Type fidelity</h2>
- * Schema derivation is dynamic via {@link AvroSchemaBuilder#fromResultSet} so
- * adding columns to {@code events} doesn't require code changes. Mapping is
- * conservative — Postgres-specific types (UUID, JSONB) are stored as strings;
- * timestamps go through Avro's {@code timestamp-micros} logical type.
+ * <p>The writer assembles the file on local disk first, then hands it to the
+ * Transfer Manager. Disk I/O is dwarfed by S3 upload time for any non-trivial
+ * partition; streaming Parquet through a pipe would mean buffering the footer
+ * separately and is more trouble than it's worth here.
  */
 @Service
 @ConditionalOnProperty(name = "archive.format", havingValue = "parquet")
 public class ParquetS3Archiver implements PartitionArchiver {
 
     private static final Logger log = LoggerFactory.getLogger(ParquetS3Archiver.class);
+
+    /**
+     * One row from {@code public.events}. Carpet derives the Parquet schema from
+     * this record's component types; mapping is straightforward except for two
+     * Postgres specifics:
+     * <ul>
+     *   <li>{@code payload} (JSONB) lands as a Parquet STRING — analytics
+     *       consumers re-parse JSON on read.</li>
+     *   <li>{@code createdAt} (TIMESTAMPTZ) is converted to {@link Instant} so
+     *       Carpet writes it as int64 with logical type {@code timestamp-micros}.</li>
+     * </ul>
+     */
+    public record EventRow(long id, UUID tenantId, String eventType, String payload, Instant createdAt) {}
 
     private final JdbcTemplate jdbcTemplate;
     private final S3TransferManager transferManager;
@@ -72,7 +75,8 @@ public class ParquetS3Archiver implements PartitionArchiver {
     @Override
     public ArchiveResult archive(PartitionInfo partition) {
         String key = s3Key(partition);
-        String selectSql = "SELECT * FROM " + quoteIdent(partition.tableName());
+        String selectSql = "SELECT id, tenant_id, event_type, payload, created_at FROM "
+                + quoteIdent(partition.tableName());
 
         Path tempFile;
         try {
@@ -82,20 +86,9 @@ public class ParquetS3Archiver implements PartitionArchiver {
         }
 
         long rowCount;
-        try {
-            // Postgres has no native temp-file collision concern; our concern is whether
-            // ParquetWriter can write to the path. AvroParquetWriter requires the file
-            // not to exist (OVERWRITE not honored when the path is empty), so delete first.
-            Files.deleteIfExists(tempFile);
-            rowCount = writeParquet(selectSql, partition.tableName(), tempFile);
-        } catch (Exception e) {
-            deleteQuietly(tempFile);
-            if (e instanceof ArchiveException ae) throw ae;
-            throw new ArchiveException("Parquet write failed for " + partition.tableName(), e);
-        }
-
         long bytesUploaded;
         try {
+            rowCount = writeParquet(selectSql, tempFile);
             bytesUploaded = Files.size(tempFile);
             log.info("Uploading partition {} as s3://{}/{} ({} rows, {} bytes parquet)",
                     partition.tableName(), props.bucket(), key, rowCount, bytesUploaded);
@@ -121,25 +114,20 @@ public class ParquetS3Archiver implements PartitionArchiver {
         return new ArchiveResult(props.bucket(), key, rowCount, bytesUploaded);
     }
 
-    private long writeParquet(String selectSql, String partitionName, Path tempFile) {
-        // LocalOutputFile (parquet-common) sidesteps hadoop-common entirely: it writes
-        // through java.nio.file directly, so we get Parquet output without dragging
-        // in jersey, kerby, woodstox, commons-* and the rest of the Hadoop universe.
-        LocalOutputFile out = new LocalOutputFile(tempFile);
-
+    private long writeParquet(String selectSql, Path tempFile) {
         return jdbcTemplate.execute((java.sql.Connection conn) -> {
             try (var stmt = conn.prepareStatement(selectSql,
                     ResultSet.TYPE_FORWARD_ONLY, ResultSet.CONCUR_READ_ONLY)) {
                 stmt.setFetchSize(1000);
-                try (ResultSet rs = stmt.executeQuery()) {
-                    Schema schema = AvroSchemaBuilder.fromResultSet(partitionName, rs.getMetaData());
-                    try (ParquetWriter<GenericRecord> writer = AvroParquetWriter
-                            .<GenericRecord>builder(out)
-                            .withSchema(schema)
-                            .withCompressionCodec(CompressionCodecName.SNAPPY)
-                            .build()) {
-                        return streamRows(rs, schema, writer);
+                try (ResultSet rs = stmt.executeQuery();
+                     OutputStream os = Files.newOutputStream(tempFile);
+                     CarpetWriter<EventRow> writer = new CarpetWriter<>(os, EventRow.class)) {
+                    long rows = 0;
+                    while (rs.next()) {
+                        writer.write(toRow(rs));
+                        rows++;
                     }
+                    return rows;
                 }
             } catch (IOException e) {
                 throw new UncheckedIOException(e);
@@ -147,69 +135,21 @@ public class ParquetS3Archiver implements PartitionArchiver {
         });
     }
 
-    private long streamRows(ResultSet rs, Schema schema, ParquetWriter<GenericRecord> writer)
-            throws SQLException, IOException {
-        ResultSetMetaData md = rs.getMetaData();
-        long rows = 0;
-        while (rs.next()) {
-            GenericRecord record = new GenericData.Record(schema);
-            for (int i = 1; i <= md.getColumnCount(); i++) {
-                record.put(md.getColumnLabel(i), readColumn(rs, i, md));
-            }
-            writer.write(record);
-            rows++;
-        }
-        return rows;
-    }
-
-    private static Object readColumn(ResultSet rs, int i, ResultSetMetaData md) throws SQLException {
-        int sqlType = md.getColumnType(i);
-        Object value = switch (sqlType) {
-            case Types.BIGINT -> {
-                long v = rs.getLong(i);
-                yield rs.wasNull() ? null : v;
-            }
-            case Types.INTEGER, Types.SMALLINT -> {
-                int v = rs.getInt(i);
-                yield rs.wasNull() ? null : v;
-            }
-            case Types.BOOLEAN, Types.BIT -> {
-                boolean v = rs.getBoolean(i);
-                yield rs.wasNull() ? null : v;
-            }
-            case Types.DOUBLE -> {
-                double v = rs.getDouble(i);
-                yield rs.wasNull() ? null : v;
-            }
-            case Types.FLOAT, Types.REAL -> {
-                float v = rs.getFloat(i);
-                yield rs.wasNull() ? null : v;
-            }
-            case Types.TIMESTAMP, Types.TIMESTAMP_WITH_TIMEZONE -> {
-                OffsetDateTime odt = rs.getObject(i, OffsetDateTime.class);
-                yield odt == null ? null : ChronoUnit.MICROS.between(Instant.EPOCH, odt.toInstant());
-            }
-            case Types.DATE -> {
-                java.sql.Date d = rs.getDate(i);
-                yield d == null ? null : (int) d.toLocalDate().toEpochDay();
-            }
-            case Types.OTHER -> readOther(rs, i, md.getColumnTypeName(i));
-            default -> rs.getString(i);
+    private static EventRow toRow(ResultSet rs) throws SQLException {
+        OffsetDateTime createdAt = rs.getObject("created_at", OffsetDateTime.class);
+        Object payloadObj = rs.getObject("payload");
+        String payload = switch (payloadObj) {
+            case null -> null;
+            case PGobject pg -> pg.getValue();
+            case String s -> s;
+            default -> payloadObj.toString();
         };
-        return value;
-    }
-
-    /**
-     * Postgres-specific OTHER types: uuid and jsonb both come through as PGobject.
-     * Stringify in both cases — analytics consumers re-parse JSON on read; UUID
-     * round-trips cleanly as its canonical hyphenated form.
-     */
-    private static String readOther(ResultSet rs, int i, String typeName) throws SQLException {
-        Object o = rs.getObject(i);
-        if (o == null) return null;
-        if (o instanceof UUID u) return u.toString();
-        if (o instanceof PGobject pg) return pg.getValue();
-        return o.toString();
+        return new EventRow(
+                rs.getLong("id"),
+                rs.getObject("tenant_id", UUID.class),
+                rs.getString("event_type"),
+                payload,
+                createdAt == null ? null : createdAt.toInstant());
     }
 
     private static void deleteQuietly(Path p) {

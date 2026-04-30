@@ -100,25 +100,15 @@
 			<artifactId>spring-retry</artifactId>
 		</dependency>
 
-		<!-- Parquet output (opt-in via archive.format=parquet). We write through
-		     LocalOutputFile from parquet-common (since 1.14, PARQUET-2449), avoiding
-		     Hadoop's filesystem abstractions entirely at runtime. -->
+		<!-- Parquet output (opt-in via archive.format=parquet). Carpet wraps
+		     parquet-java with a Java-records API and absorbs the parquet-hadoop
+		     dependency dance into its own pom. We get a clean OutputStream-based
+		     writer here without an explicit hadoop-common, parquet-avro, or
+		     spring-boot-maven-plugin exclusion list. -->
 		<dependency>
-			<groupId>org.apache.parquet</groupId>
-			<artifactId>parquet-avro</artifactId>
-			<version>1.15.0</version>
-		</dependency>
-		<!-- Compile-only: AvroParquetWriter#builder(...) is overloaded to accept
-		     org.apache.hadoop.fs.Path, so javac needs the class visible to resolve
-		     method candidates even though we never call that overload. provided +
-		     optional keeps hadoop-common out of the runtime fat jar; spring-boot-
-		     maven-plugin honours both flags when repackaging. -->
-		<dependency>
-			<groupId>org.apache.hadoop</groupId>
-			<artifactId>hadoop-common</artifactId>
-			<version>3.5.0</version>
-			<scope>provided</scope>
-			<optional>true</optional>
+			<groupId>com.jerolba</groupId>
+			<artifactId>carpet-record</artifactId>
+			<version>0.7.0</version>
 		</dependency>
 
 		<dependency>
@@ -160,16 +150,6 @@
 			<plugin>
 				<groupId>org.springframework.boot</groupId>
 				<artifactId>spring-boot-maven-plugin</artifactId>
-				<configuration>
-					<!-- hadoop-common is declared above as compile-only (it's needed for
-					     javac to resolve AvroParquetWriter#builder overloads). At runtime
-					     ParquetS3Archiver uses LocalOutputFile from parquet-common and
-					     never touches Hadoop's filesystem code. Strip the entire hadoop-*
-					     family from the runnable jar to avoid shipping ~10 MB of unused
-					     classes plus jersey/kerby/woodstox transitives that would come
-					     with hadoop-common at compile/runtime scope. -->
-					<excludeGroupIds>org.apache.hadoop,org.apache.hadoop.thirdparty</excludeGroupIds>
-				</configuration>
 			</plugin>
 			<plugin>
 				<groupId>org.apache.maven.plugins</groupId>
