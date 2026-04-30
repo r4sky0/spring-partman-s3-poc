@@ -3,11 +3,10 @@ package com.example.archive.archive;
 import org.apache.avro.Schema;
 import org.apache.avro.generic.GenericData;
 import org.apache.avro.generic.GenericRecord;
-import org.apache.hadoop.conf.Configuration;
 import org.apache.parquet.avro.AvroParquetWriter;
 import org.apache.parquet.hadoop.ParquetWriter;
 import org.apache.parquet.hadoop.metadata.CompressionCodecName;
-import org.apache.parquet.hadoop.util.HadoopOutputFile;
+import org.apache.parquet.io.LocalOutputFile;
 import org.postgresql.util.PGobject;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -123,8 +122,10 @@ public class ParquetS3Archiver implements PartitionArchiver {
     }
 
     private long writeParquet(String selectSql, String partitionName, Path tempFile) {
-        Configuration conf = new Configuration();
-        org.apache.hadoop.fs.Path hadoopPath = new org.apache.hadoop.fs.Path(tempFile.toUri());
+        // LocalOutputFile (parquet-common) sidesteps hadoop-common entirely: it writes
+        // through java.nio.file directly, so we get Parquet output without dragging
+        // in jersey, kerby, woodstox, commons-* and the rest of the Hadoop universe.
+        LocalOutputFile out = new LocalOutputFile(tempFile);
 
         return jdbcTemplate.execute((java.sql.Connection conn) -> {
             try (var stmt = conn.prepareStatement(selectSql,
@@ -133,9 +134,8 @@ public class ParquetS3Archiver implements PartitionArchiver {
                 try (ResultSet rs = stmt.executeQuery()) {
                     Schema schema = AvroSchemaBuilder.fromResultSet(partitionName, rs.getMetaData());
                     try (ParquetWriter<GenericRecord> writer = AvroParquetWriter
-                            .<GenericRecord>builder(HadoopOutputFile.fromPath(hadoopPath, conf))
+                            .<GenericRecord>builder(out)
                             .withSchema(schema)
-                            .withConf(conf)
                             .withCompressionCodec(CompressionCodecName.SNAPPY)
                             .build()) {
                         return streamRows(rs, schema, writer);

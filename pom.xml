@@ -100,43 +100,25 @@
 			<artifactId>spring-retry</artifactId>
 		</dependency>
 
-		<!-- Parquet output (opt-in via archive.format=parquet). Hadoop-common is here
-		     for ParquetWriter's Path/Configuration types, not for any HDFS interaction —
-		     hence the aggressive exclusions to keep the jar set under control. -->
+		<!-- Parquet output (opt-in via archive.format=parquet). We write through
+		     LocalOutputFile from parquet-common (since 1.14, PARQUET-2449), avoiding
+		     Hadoop's filesystem abstractions entirely at runtime. -->
 		<dependency>
 			<groupId>org.apache.parquet</groupId>
 			<artifactId>parquet-avro</artifactId>
 			<version>1.15.0</version>
 		</dependency>
+		<!-- Compile-only: AvroParquetWriter#builder(...) is overloaded to accept
+		     org.apache.hadoop.fs.Path, so javac needs the class visible to resolve
+		     method candidates even though we never call that overload. provided +
+		     optional keeps hadoop-common out of the runtime fat jar; spring-boot-
+		     maven-plugin honours both flags when repackaging. -->
 		<dependency>
 			<groupId>org.apache.hadoop</groupId>
 			<artifactId>hadoop-common</artifactId>
-			<!-- 3.5.0 ships the Java 21+ Subject.current() migration. Earlier 3.4.x
-			     throws UnsupportedOperationException at runtime on Java 24+ via
-			     the removed static Subject.getSubject(). -->
 			<version>3.5.0</version>
-			<exclusions>
-				<!-- NOTE: do NOT exclude org.apache.hadoop.thirdparty — it contains
-				     hadoop's shaded Guava (Interners, etc.) that ParquetWriter relies
-				     on at runtime. Removing it produces a NoClassDefFoundError on the
-				     first row written. -->
-				<exclusion><groupId>org.eclipse.jetty</groupId><artifactId>*</artifactId></exclusion>
-				<exclusion><groupId>com.google.protobuf</groupId><artifactId>*</artifactId></exclusion>
-				<exclusion><groupId>org.apache.zookeeper</groupId><artifactId>*</artifactId></exclusion>
-				<exclusion><groupId>org.apache.curator</groupId><artifactId>*</artifactId></exclusion>
-				<exclusion><groupId>org.apache.kerby</groupId><artifactId>*</artifactId></exclusion>
-				<exclusion><groupId>org.apache.avro</groupId><artifactId>*</artifactId></exclusion>
-				<exclusion><groupId>org.bouncycastle</groupId><artifactId>*</artifactId></exclusion>
-				<exclusion><groupId>com.jcraft</groupId><artifactId>*</artifactId></exclusion>
-				<exclusion><groupId>com.sun.jersey</groupId><artifactId>*</artifactId></exclusion>
-				<exclusion><groupId>javax.servlet</groupId><artifactId>*</artifactId></exclusion>
-				<exclusion><groupId>javax.servlet.jsp</groupId><artifactId>*</artifactId></exclusion>
-				<exclusion><groupId>org.codehaus.jackson</groupId><artifactId>*</artifactId></exclusion>
-				<exclusion><groupId>com.fasterxml.jackson.core</groupId><artifactId>*</artifactId></exclusion>
-				<exclusion><groupId>com.fasterxml.jackson.dataformat</groupId><artifactId>*</artifactId></exclusion>
-				<exclusion><groupId>org.slf4j</groupId><artifactId>slf4j-reload4j</artifactId></exclusion>
-				<exclusion><groupId>ch.qos.reload4j</groupId><artifactId>*</artifactId></exclusion>
-			</exclusions>
+			<scope>provided</scope>
+			<optional>true</optional>
 		</dependency>
 
 		<dependency>
@@ -178,6 +160,16 @@
 			<plugin>
 				<groupId>org.springframework.boot</groupId>
 				<artifactId>spring-boot-maven-plugin</artifactId>
+				<configuration>
+					<!-- hadoop-common is declared above as compile-only (it's needed for
+					     javac to resolve AvroParquetWriter#builder overloads). At runtime
+					     ParquetS3Archiver uses LocalOutputFile from parquet-common and
+					     never touches Hadoop's filesystem code. Strip the entire hadoop-*
+					     family from the runnable jar to avoid shipping ~10 MB of unused
+					     classes plus jersey/kerby/woodstox transitives that would come
+					     with hadoop-common at compile/runtime scope. -->
+					<excludeGroupIds>org.apache.hadoop,org.apache.hadoop.thirdparty</excludeGroupIds>
+				</configuration>
 			</plugin>
 			<plugin>
 				<groupId>org.apache.maven.plugins</groupId>
