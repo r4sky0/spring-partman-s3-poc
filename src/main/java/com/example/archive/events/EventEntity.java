@@ -5,7 +5,6 @@ import jakarta.persistence.Entity;
 import jakarta.persistence.GeneratedValue;
 import jakarta.persistence.GenerationType;
 import jakarta.persistence.Id;
-import jakarta.persistence.IdClass;
 import jakarta.persistence.Table;
 import org.hibernate.annotations.JdbcTypeCode;
 import org.hibernate.type.SqlTypes;
@@ -19,9 +18,18 @@ import java.util.UUID;
  * <h2>Partitioning contract</h2>
  * The underlying table is range-partitioned daily by {@code created_at} and
  * managed by pg_partman ({@code V1__events_table.sql}, {@code V2__partman_config.sql}).
- * The composite PK {@code (id, created_at)} is required by Postgres native
- * partitioning — the partition key must be part of the PK — and is mirrored
- * here via {@link IdClass} on {@link EventId}.
+ * Postgres native partitioning requires the partition key inside the PK — the DB
+ * column declares {@code PRIMARY KEY (id, created_at)} and Postgres still enforces
+ * that constraint.
+ *
+ * <p>Hibernate, however, does not support {@code GenerationType.IDENTITY} on a
+ * component of an {@code @IdClass} composite (the
+ * {@code "Identity generation isn't supported for composite ids"} surface). We
+ * therefore expose only {@code id} as the JPA-side identifier; from JPA's
+ * perspective it's a single-column PK, while Postgres still enforces the real
+ * composite at the storage layer. {@code repository.findById(Long)} consequently
+ * does not uniquely identify a row — acceptable here because the entity is
+ * append-only and we never read individual events by id alone.
  *
  * <h2>Lifecycle</h2>
  * Treat this entity as <strong>append-only</strong>. The archive job
@@ -35,15 +43,13 @@ import java.util.UUID;
  */
 @Entity
 @Table(name = "events")
-@IdClass(EventId.class)
 public class EventEntity {
 
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
 
-    @Id
-    @Column(name = "created_at", updatable = false)
+    @Column(name = "created_at", nullable = false, updatable = false)
     private OffsetDateTime createdAt;
 
     @Column(name = "tenant_id", nullable = false, updatable = false)
