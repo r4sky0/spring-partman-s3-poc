@@ -6,10 +6,14 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.dao.DataAccessException;
 import org.springframework.jdbc.core.simple.JdbcClient;
+import org.springframework.retry.support.RetryTemplate;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.support.TransactionTemplate;
 
+import javax.sql.DataSource;
+import java.sql.Connection;
+import java.sql.SQLException;
 import java.util.List;
 
 /**
@@ -19,11 +23,19 @@ import java.util.List;
  * the DB transaction; the bookkeeping (archive_log insert + DETACH + DROP) runs
  * inside it. A failure between upload and commit just leaves an orphan S3 object
  * that the next tick re-PUTs to the same key (S3 PUT is idempotent on key).
+ *
+ * <p>{@link #runOnce()} is gated by a session-scoped Postgres advisory lock so
+ * that scheduled instances on multiple replicas don't race on {@code DETACH
+ * PARTITION} (which takes ACCESS EXCLUSIVE on the parent table). One instance
+ * per cycle does work; the others observe the lock contention and return an
+ * empty summary.
  */
 @Component
 public class PartitionArchiveJob {
 
     private static final Logger log = LoggerFactory.getLogger(PartitionArchiveJob.class);
+
+    private static final ArchiveSummary EMPTY_SUMMARY = new ArchiveSummary(0, 0L, 0L);
 
     private static final String INSERT_LOG_SQL = """
             INSERT INTO archive_log
@@ -31,25 +43,32 @@ public class PartitionArchiveJob {
             VALUES (:name, :bucket, :key, :rows, :bytes)
             """;
 
+    private final DataSource dataSource;
     private final JdbcClient jdbcClient;
     private final PartitionDiscoveryService discovery;
     private final PartitionArchiver archiver;
     private final TransactionTemplate tx;
+    private final RetryTemplate archiveRetryTemplate;
     private final Counter partitionsArchived;
     private final Counter rowsArchived;
     private final Counter bytesUploaded;
     private final Counter failures;
+    private final Counter cyclesSkipped;
 
     public PartitionArchiveJob(
+            DataSource dataSource,
             JdbcClient jdbcClient,
             PartitionDiscoveryService discovery,
             PartitionArchiver archiver,
             TransactionTemplate tx,
+            RetryTemplate archiveRetryTemplate,
             MeterRegistry meterRegistry) {
+        this.dataSource = dataSource;
         this.jdbcClient = jdbcClient;
         this.discovery = discovery;
         this.archiver = archiver;
         this.tx = tx;
+        this.archiveRetryTemplate = archiveRetryTemplate;
         this.partitionsArchived = meterRegistry.counter("archive.partitions.archived");
         this.rowsArchived = meterRegistry.counter("archive.rows.archived");
         // archive.bytes.uploaded counts S3 PUT bytes — a partition whose tx fails
@@ -57,6 +76,9 @@ public class PartitionArchiveJob {
         // upload-vs-committed counters is left for production hardening.
         this.bytesUploaded = meterRegistry.counter("archive.bytes.uploaded");
         this.failures = meterRegistry.counter("archive.failures");
+        // archive.cycles.skipped: another instance held the advisory lock when this
+        // tick fired. Expected to climb with replica count under steady load.
+        this.cyclesSkipped = meterRegistry.counter("archive.cycles.skipped");
     }
 
     @Scheduled(fixedDelayString = "${archive.interval:60s}", initialDelayString = "${archive.interval:60s}")
@@ -69,10 +91,31 @@ public class PartitionArchiveJob {
     }
 
     /**
-     * Single archive cycle. Returns a summary suitable for HTTP response or test assertion.
-     * Runs pg_partman maintenance first so any newly-eligible partitions exist before discovery.
+     * Single archive cycle. Acquires a session-scoped advisory lock on a
+     * dedicated connection; if another instance already holds it, returns an
+     * empty summary without doing any work. The lock is always released in the
+     * finally block, and the connection is closed by try-with-resources so the
+     * lock never leaks back into the pool.
      */
     public ArchiveSummary runOnce() {
+        try (Connection lockConn = dataSource.getConnection()) {
+            if (!AdvisoryLock.tryLock(lockConn, AdvisoryLock.ARCHIVE_EVENTS_KEY)) {
+                log.debug("Another instance holds the archive advisory lock — skipping cycle");
+                cyclesSkipped.increment();
+                return EMPTY_SUMMARY;
+            }
+            try {
+                return runOnceLocked();
+            } finally {
+                AdvisoryLock.unlock(lockConn, AdvisoryLock.ARCHIVE_EVENTS_KEY);
+            }
+        } catch (SQLException e) {
+            throw new ArchiveException("Could not acquire archive advisory lock", e);
+        }
+    }
+
+    /** Runs pg_partman maintenance first so any newly-eligible partitions exist before discovery. */
+    private ArchiveSummary runOnceLocked() {
         runMaintenance();
         List<PartitionInfo> candidates = discovery.findArchivable();
         log.info("Archive cycle: {} candidate partition(s) eligible", candidates.size());
@@ -82,7 +125,9 @@ public class PartitionArchiveJob {
         long totalBytes = 0;
         for (PartitionInfo p : candidates) {
             try {
-                ArchiveResult result = archiver.archive(p);
+                // Retry only the upload — DDL block stays under the per-partition
+                // firebreak below since DETACH is not idempotent under retry.
+                ArchiveResult result = archiveRetryTemplate.execute(ctx -> archiver.archive(p));
                 tx.executeWithoutResult(_ -> {
                     jdbcClient.sql(INSERT_LOG_SQL)
                             .param("name", p.tableName())

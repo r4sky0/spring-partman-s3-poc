@@ -92,6 +92,14 @@
 			<version>${awscrt.version}</version>
 		</dependency>
 
+		<!-- Programmatic RetryTemplate around the S3 upload step. We do NOT pull in
+		     spring-aspects: @Retryable lives at method boundaries, but our retry-able
+		     unit is a single statement inside runOnce(), so we wire it in code. -->
+		<dependency>
+			<groupId>org.springframework.retry</groupId>
+			<artifactId>spring-retry</artifactId>
+		</dependency>
+
 		<dependency>
 			<groupId>org.springframework.boot</groupId>
 			<artifactId>spring-boot-docker-compose</artifactId>
