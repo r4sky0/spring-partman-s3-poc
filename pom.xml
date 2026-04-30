@@ -17,6 +17,10 @@
 	<properties>
 		<java.version>25</java.version>
 		<awssdk.version>2.30.31</awssdk.version>
+		<!-- aws-crt is in a separate group (software.amazon.awssdk.crt) and is NOT
+		     managed by the awssdk BOM. 0.34.1 is the version awssdk 2.30.31's parent
+		     pom pins internally — keeping them aligned avoids ABI mismatches at runtime. -->
+		<awscrt.version>0.34.1</awscrt.version>
 		<testcontainers.version>1.21.4</testcontainers.version>
 	</properties>
 
@@ -71,6 +75,21 @@
 		<dependency>
 			<groupId>software.amazon.awssdk</groupId>
 			<artifactId>url-connection-client</artifactId>
+		</dependency>
+		<!-- High-level streaming uploader. Built on the CRT-based S3AsyncClient,
+		     which uploads multipart in parallel and accepts unknown content lengths —
+		     the streaming COPY → gzip → S3 pipeline depends on both properties. -->
+		<dependency>
+			<groupId>software.amazon.awssdk</groupId>
+			<artifactId>s3-transfer-manager</artifactId>
+		</dependency>
+		<!-- Native AWS Common Runtime binding. s3-transfer-manager declares this
+		     as optional, so it must be added explicitly. Pulls in platform-specific
+		     native libraries — incompatible with Alpine/musl base images. -->
+		<dependency>
+			<groupId>software.amazon.awssdk.crt</groupId>
+			<artifactId>aws-crt</artifactId>
+			<version>${awscrt.version}</version>
 		</dependency>
 
 		<dependency>
